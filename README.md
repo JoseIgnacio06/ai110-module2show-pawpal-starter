@@ -44,6 +44,32 @@ Calling `scheduler.mark_task_complete(task)` marks the task done, calculates `ne
 **Conflict detection**
 `detect_conflicts(tasks)` scans the scheduled plan for any two tasks that share the same `scheduled_time`. Same-pet and cross-pet collisions are labelled separately and returned as warning strings. The planner never crashes — it warns and continues.
 
+## Testing PawPal+
+
+### Running the tests
+
+```bash
+python -m pytest tests/test_pawpal.py -v
+```
+
+### What the tests cover
+
+The suite contains 17 tests across five areas:
+
+| Area | Tests | What is verified |
+|---|---|---|
+| **Task completion** | 2 | `mark_complete()` sets `completed=True` and records today's date; `add_task()` increments pet task count |
+| **Sorting** | 3 | Tasks sort chronologically by `scheduled_time`; untimed tasks sink to the end; all-`None` list does not crash |
+| **Recurrence** | 4 | Completing a daily task creates a new non-due instance; `next_due` is exactly today + 1 day (daily) or + 7 days (weekly); unknown frequency returns `None` without crashing |
+| **Conflict detection** | 5 | Cross-pet and same-pet collisions are labelled correctly; no collision returns empty list; untimed tasks are ignored; three tasks at one slot produce one warning, not two |
+| **Budget packing** | 3 | Plan never exceeds `daily_available_time`; empty pet returns empty plan; owner with no pets returns empty plan |
+
+### Confidence level
+
+★★★★☆ (4 / 5)
+
+The core scheduling pipeline — filtering, prioritizing, budget packing, recurrence, and conflict detection — is fully covered by unit tests, and all 17 pass. The one-star deduction reflects what is not yet tested: the Streamlit UI layer (`app.py`), `st.session_state` persistence across reruns, and integration between the UI inputs and the scheduler output. Those paths can only be verified with browser-level or end-to-end tests, which are not included in the current suite.
+
 ## Getting started
 
 ### Setup
