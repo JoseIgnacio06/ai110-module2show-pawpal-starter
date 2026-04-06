@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import date
+from datetime import date, timedelta
 from typing import List, Dict, Optional, TypedDict
 
 
@@ -8,6 +8,7 @@ class DailyPlan(TypedDict):
     tasks: List[Task]
     total_duration: int
     explanations: List[str]
+    conflicts: List[str]
 
 
 # Maps priority labels to sort order (lower = scheduled first)
@@ -28,6 +29,7 @@ class Task:
         time_constraints: str,
         pet: Pet,
         last_completed: Optional[date] = None,
+        scheduled_time: Optional[str] = None,
     ):
         self.name = name
         self.duration = duration                      # minutes
@@ -36,12 +38,41 @@ class Task:
         self.time_constraints = time_constraints      # "morning" | "evening" | "any"
         self.pet = pet
         self.last_completed: Optional[date] = last_completed
+        self.scheduled_time: Optional[str] = scheduled_time  # "HH:MM", e.g. "08:00"
         self.completed: bool = False
+        self.next_due: Optional[date] = None  # set by mark_complete()
 
     def mark_complete(self) -> None:
-        """Mark the task as completed and record today as the completion date."""
+        """Mark the task done, record today, and calculate the next due date.
+
+        next_due uses timedelta so the arithmetic is always exact:
+            daily   → today + timedelta(days=1)
+            weekly  → today + timedelta(days=7)
+            monthly → today + timedelta(days=30)
+        timedelta(days=N) adds exactly N * 24 h, avoiding any month-length
+        or leap-year ambiguity that calendar arithmetic would introduce.
+        """
         self.completed = True
         self.last_completed = date.today()
+        days_ahead = _FREQUENCY_DAYS.get(self.frequency, 1)
+        self.next_due = date.today() + timedelta(days=days_ahead)
+
+    def recur(self) -> Task:
+        """Return a fresh Task instance for the next occurrence.
+
+        last_completed is set to today so is_due_today() correctly returns
+        False until the frequency threshold has passed again.
+        """
+        return Task(
+            name=self.name,
+            duration=self.duration,
+            priority=self.priority,
+            frequency=self.frequency,
+            time_constraints=self.time_constraints,
+            pet=self.pet,
+            last_completed=date.today(),
+            scheduled_time=self.scheduled_time,
+        )
 
     def is_due_today(self) -> bool:
         """Return True if enough time has passed since last completion per frequency."""
@@ -231,6 +262,117 @@ class Scheduler:
 
         return plan
 
+    def filter_by(
+        self,
+        tasks: List[Task],
+        pet_name: Optional[str] = None,
+        completed: Optional[bool] = None,
+    ) -> List[Task]:
+        """Filter a task list by pet name, completion status, or both.
+
+        Args:
+            tasks:      The list to filter (e.g. from generate_plan or get_all_tasks).
+            pet_name:   Keep only tasks belonging to this pet (case-insensitive).
+                        Pass None to skip this filter.
+            completed:  Pass True for completed tasks, False for pending,
+                        None to skip this filter.
+
+        Examples:
+            # All pending tasks across every pet
+            scheduler.filter_by(all_tasks, completed=False)
+
+            # Completed tasks for Buddy only
+            scheduler.filter_by(all_tasks, pet_name="Buddy", completed=True)
+        """
+        result = tasks
+        if pet_name is not None:
+            result = [t for t in result if t.pet.name.lower() == pet_name.lower()]
+        if completed is not None:
+            result = [t for t in result if t.completed == completed]
+        return result
+
+    def sort_by_time(self, tasks: List[Task]) -> List[Task]:
+        """Sort tasks by scheduled_time in ascending order ("HH:MM").
+
+        Tasks without a scheduled_time are placed at the end.
+
+        How the lambda works:
+          sorted() calls the key function once per item to get a
+          comparison value. "HH:MM" strings are zero-padded, so they
+          sort correctly as plain strings ("08:00" < "14:30" < "23:00").
+          Tasks missing a time get "99:99" so they always sink to the end.
+
+        Example:
+            tasks = [task_at_14h, task_at_08h, task_no_time]
+            sort_by_time(tasks)
+            → [task_at_08h, task_at_14h, task_no_time]
+        """
+        return sorted(
+            tasks,
+            key=lambda t: t.scheduled_time if t.scheduled_time is not None else "99:99",
+        )
+
+    def detect_conflicts(self, tasks: List[Task]) -> List[str]:
+        """Return a warning string for every pair of tasks that share a scheduled_time.
+
+        Strategy (lightweight — warns, never raises):
+          - Only tasks that have a scheduled_time are checked.
+          - Tasks without a time are silently ignored; no crash, no false positives.
+          - Each unique time slot is grouped; any slot with 2+ tasks is a conflict.
+          - Same-pet and cross-pet collisions are both caught and labelled differently.
+
+        Returns an empty list when there are no conflicts.
+        """
+        warnings: List[str] = []
+
+        # Group tasks by their scheduled_time, skipping any that have no time set
+        slots: Dict[str, List[Task]] = {}
+        for task in tasks:
+            if task.scheduled_time is None:
+                continue
+            slots.setdefault(task.scheduled_time, []).append(task)
+
+        for time_slot, slot_tasks in sorted(slots.items()):
+            if len(slot_tasks) < 2:
+                continue  # no conflict at this slot
+
+            names = ", ".join(f"'{t.name}' ({t.pet.name})" for t in slot_tasks)
+            pets  = {t.pet.name for t in slot_tasks}
+
+            if len(pets) == 1:
+                label = "same-pet conflict"
+            else:
+                label = "cross-pet conflict"
+
+            warnings.append(
+                f"CONFLICT at {time_slot} [{label}]: {names}"
+            )
+
+        return warnings
+
+    def mark_task_complete(self, task: Task) -> Optional[Task]:
+        """Mark a task complete and auto-create the next occurrence for recurring tasks.
+
+        For daily/weekly/monthly tasks a new Task instance is added to the
+        same pet immediately, with last_completed=today so it won't appear
+        in today's plan again.  The next_due date on the completed task shows
+        exactly when the new instance will become due.
+
+        Returns the new Task instance, or None for non-recurring tasks.
+        """
+        task.mark_complete()
+
+        if task.frequency not in _FREQUENCY_DAYS:
+            return None
+
+        next_task = task.recur()
+        task.pet.add_task(next_task)
+        self._decisions.append(
+            f"RECUR '{task.name}' ({task.pet.name}): "
+            f"next due {task.next_due} [{task.frequency}]"
+        )
+        return next_task
+
     def explain_decisions(self) -> List[str]:
         """Return the audit log from the most recent generate_plan call."""
         return list(self._decisions)
@@ -243,4 +385,5 @@ class Scheduler:
             tasks=plan,
             total_duration=sum(t.duration for t in plan),
             explanations=self.explain_decisions(),
+            conflicts=self.detect_conflicts(plan),
         )
